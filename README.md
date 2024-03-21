@@ -1,0 +1,2 @@
+# Ari_Shogi_NNUE_train
+Pytorchで将棋のNNUE評価関数の学習をするプログラム
