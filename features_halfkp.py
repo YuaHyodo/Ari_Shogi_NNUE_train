@@ -3,6 +3,9 @@
 https://github.com/bleu48/shogi-eval/blob/master/evaltest_nnue.py
 https://github.com/bleu48/shogi-eval/blob/master/sample4-5a.py
 あたりを参考に作った。
+
+入力特徴量がバグっていると大損する( 23年の電竜戦でAri Shogiはそれで実際大損した )ので、
+コードに変更を加えた場合は、ランダムに生成した大量の局面で変更前と同じ出力になるかをテストするようにしている。
 """
 
 import cshogi

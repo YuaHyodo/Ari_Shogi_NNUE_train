@@ -1,6 +1,5 @@
 """
 python-dlshogi2のtrain.py(https://github.com/TadaoYamaoka/python-dlshogi2/blob/main/pydlshogi2/train.py)をベース(にしているAri Shogiの学習部をベース)にしている
-elmo式に関する部分は、dlshogiのtrain.py( https://github.com/TadaoYamaoka/DeepLearningShogi/blob/master/dlshogi/train.py )を参考にしている。
 """
 from NNUE_network1 import*
 from dataloader import*
@@ -24,6 +23,8 @@ parser.add_argument('--epoch', '-e', type=int, default=1)
 parser.add_argument('--batchsize', '-b', type=int, default=1024)
 parser.add_argument('--test_batchsize', '-t', type=int, default=1024)
 
+parser.add_argument('--network_size', type=str, default='halfkp_256_32_32')
+
 #elmo式における勝敗項と勝率項のバランスをとる部分
 #評価値を使わない設定(下のeval_aが0)の場合は無視される
 parser.add_argument('--val_lambda', type=float, default=0.33)
@@ -35,6 +36,10 @@ parser.add_argument('--val_lambda', type=float, default=0.33)
 #https://tadaoyamaoka.hatenablog.com/entry/2021/05/06/213506
 parser.add_argument('--eval_a', type=int, default=0)
 parser.add_argument('--eval_a_test', type=int, default=0)
+
+#
+parser.add_argument('--label_smoothing', type=float, default=0.0)
+parser.add_argument('--result_label_noise', type=float, default=0.0)
 
 #AMPを使用するか(ONにする事を推奨)
 parser.add_argument('--use_amp', action='store_true')
@@ -62,14 +67,19 @@ parser.add_argument('--sgd_momentum', type=float, default=0.9)
 parser.add_argument('--sgd_nesterov', action='store_true')
 parser.add_argument('--adam_eps', type=float, default=1e-8)
 
-#学習率スケジューラーに関する設定
+#学習率スケジューラーに関して
 #CyclicLRの場合、設定された学習率をbase、その--CyclicLR_maxLR倍の値をmaxに設定する
 #ReduceLROnPlateauの場合、設定された学習率を初期値に設定する
 parser.add_argument('--lr_scheduler_type', type=str, default='none')#none(なし) / CyclicLR / ReduceLROnPlateau
+#CyclicLRの場合のみ有効。maxLRをbaseLRの何倍にするか
 parser.add_argument('--CyclicLR_maxLR', type=float, default=10.0)
+#CyclicLRの場合のみ有効。maxLRとbaseLRを移動する際(片道)に何ステップをかけるか
 parser.add_argument('--CyclicLR_step_size', type=int, default=2000)
+#ReduceLROnPlateauの場合のみ有効。val_lossが何epoch連続で下がらなかった場合に学習率を下げるか
 parser.add_argument('--ReduceLROnPlateau_patience', type=int, default=2)
+#ReduceLROnPlateauの場合のみ有効。学習率を下げる際にどれくらい下げるか決める。0.1だと10分の1、0.5だと2分の1、という感じ
 parser.add_argument('--ReduceLROnPlateau_factor', type=float, default=0.1)
+#ReduceLROnPlateauの場合のみ有効。val_lossが下がらなかったかの判定を寛容にできたりする
 parser.add_argument('--ReduceLROnPlateau_threshold', type=float, default=0.0001)
 
 #チェックポイントのディレクトリ
@@ -81,6 +91,7 @@ parser.add_argument('--log', type=str, default='NNUE_train_test.txt')
 
 #何epochに1回セーブするか( 何epochも回すとき、1epoch毎にセーブされるファイルでストレージが圧迫されるので、その時に使う)
 parser.add_argument('--save_model_interval', type=int, default=1)
+parser.add_argument('--eval_all_data_epoch_interval', type=int, default=1)
 
 #1epoch中にバックアップを取る場合のオプション
 #( GoogleColabみたいな環境で使うときや1epochが長い場合に使うと悲しい事故を防げるかもしれない )
@@ -112,33 +123,47 @@ else:
 bce_with_logits_loss = torch.nn.BCEWithLogitsLoss()
 scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
 
+network_size = [int(i) for i in args.network_size.split('_')[1:]]
+
 load_ckpt = False
 if args.resume == '':
     print_kai('make_new_model'.format(args.resume))
-    model = NNUE_halfkp(L1=256, L2=32, L3=32)
+    model = NNUE_halfkp(L1=network_size[0], L2=network_size[1], L3=network_size[2])
 else:
     print_kai('Loading the checkpoint from {}'.format(args.resume))
     if '.bin' in args.resume:
         print_kai('Load from .bin')
         with open(args.resume, 'rb') as f:
-            reader = NNUEReader(f)
+            reader = NNUEReader(f, L1=network_size[0], L2=network_size[1], L3=network_size[2])
         model = reader.model
     else:
         print_kai('Load from checkpoint')
         load_ckpt = True
         ckpt = torch.load(args.resume, map_location=device)
-        model = NNUE_halfkp(L1=256, L2=32, L3=32)
+        if 'network_size' in ckpt:
+            network_size = [int(i) for i in ckpt['network_size'].split('_')[1:]]
+            args.network_size = ckpt['network_size']
+        model = NNUE_halfkp(L1=network_size[0], L2=network_size[1], L3=network_size[2])
         
 #設定に基づいてパラメータを作り直す
 if args.make_new_layer_input:
     print_kai('input_layer is included in the layer to be initialized.')
     model.input_layer = nn.Linear(features_num, model.units[0])
+    #torch.nn.init.kaiming_uniform_(model.input_layer.weight, nonlinearity='relu')
+    torch.nn.init.kaiming_normal_(model.input_layer.weight, nonlinearity='relu')
+    
 if args.make_new_layer_L1:
     print_kai('L1_layer is included in the layer to be initialized.')
     model.l1 = nn.Linear(model.units[0] * 2, model.units[1])
+    #torch.nn.init.kaiming_uniform_(model.l1.weight, nonlinearity='relu')
+    torch.nn.init.kaiming_normal_(model.l1.weight, nonlinearity='relu')
+    
 if args.make_new_layer_L2:
     print_kai('L2_layer is included in the layer to be initialized.')
     model.l2 = nn.Linear(model.units[1], model.units[2])
+    #torch.nn.init.kaiming_uniform_(model.l2.weight, nonlinearity='relu')
+    torch.nn.init.kaiming_normal_(model.l2.weight, nonlinearity='relu')
+    
 if args.make_new_layer_output:
     print_kai('output_layer is included in the layer to be initialized.')
     model.output_layer = nn.Linear(model.units[2], 1)
@@ -259,7 +284,8 @@ def save_model(m, opt, sca, e, dire=None):
             'optimizer': opt.state_dict(),
             'scaler': sca.state_dict(),
             'opt_type': args.optimizer,
-            'lr_scheduler_type': args.lr_scheduler_type}
+            'lr_scheduler_type': args.lr_scheduler_type,
+            'network_size': args.network_size,}
     if args.lr_scheduler_type not in ('ReduceLROnPlateau'):
         ckpt['lr_scheduler_state_dict'] = 0
     else:
@@ -283,8 +309,8 @@ def eval_model(model, dataloader, batch_num=None):
             if dataloader.eval_a == 0:
                 test_loss = bce_with_logits_loss(y, result).item()
             else:
-                loss1 = bce_with_logits_loss(y, result)
-                loss2 = bce_with_logits_loss(y, value)
+                loss1 = bce_with_logits_loss(y, result)#勝敗項
+                loss2 = bce_with_logits_loss(y, value)#勝率項
                 loss = (loss1 * (1.0 - args.val_lambda) + loss2 * args.val_lambda)
                 test_loss = loss.item()
             test_acc = binary_accuracy(y, result)
@@ -298,16 +324,16 @@ def eval_model(model, dataloader, batch_num=None):
             y = model(x1, x2)
             if dataloader.eval_a == 0:
                 #評価値を使わない場合
-                test_loss = bce_with_logits_loss(y, result).item()
+                test_loss += bce_with_logits_loss(y, result).item()
             else:
-                loss1 = bce_with_logits_loss(y, result)
-                loss2 = bce_with_logits_loss(y, value)
+                loss1 = bce_with_logits_loss(y, result)#勝敗項
+                loss2 = bce_with_logits_loss(y, value)#勝率項
                 loss = (loss1 * (1.0 - args.val_lambda) + loss2 * args.val_lambda)
                 test_loss += loss.item()
             test_acc += binary_accuracy(y, result)
         if batch_num is not None and i >= batch_num:
             break
-        return test_loss / test_steps, test_acc / test_steps
+    return test_loss / test_steps, test_acc / test_steps
 
 if args.test_before_train:
     print_kai('test_before_train == True')
@@ -323,7 +349,9 @@ for e in range(args.epoch):
     steps_interval_b = 0
     for train_data_C in train_data:
         train_dataloader = HcpeDataLoader(train_data_C, args.batchsize, device,
-                    shuffle=True, eval_a=args.eval_a, unique=args.unique)
+                    shuffle=True, eval_a=args.eval_a, unique=args.unique,
+                                          label_smoothing=args.label_smoothing,
+                                          result_label_noise=args.result_label_noise)
         for x1, x2, result, value in train_dataloader:
             with torch.cuda.amp.autocast(enabled=args.use_amp):
                 model.train()
@@ -363,10 +391,11 @@ for e in range(args.epoch):
         print_kai('save checkpoint')
         save_model(model, optimizer, scaler, e)
     #
-    print_kai('start eval model')
-    test_loss, test_acc = eval_model(model, test_dataloader)
-    print_kai('epoch = {}, steps = {}, train_loss_avr = {}, test_loss = {}, test_acc = {}'.format(e, steps_epoch,
-        sum_loss_epoch / steps_epoch, test_loss, test_acc))
+    if e % args.eval_all_data_epoch_interval == 0 or e == args.epoch-1 or args.lr_scheduler_type == 'ReduceLROnPlateau':
+        print_kai('start eval model')
+        test_loss, test_acc = eval_model(model, test_dataloader)
+        print_kai('epoch = {}, steps = {}, train_loss_avr = {}, test_loss = {}, test_acc = {}'.format(e, steps_epoch,
+            sum_loss_epoch / steps_epoch, test_loss, test_acc))
     if args.lr_scheduler_type == 'ReduceLROnPlateau':
         lr_scheduler.step(test_loss)
     print_kai('finish_epoch {}'.format(e))
@@ -377,7 +406,7 @@ save_model(model, optimizer, scaler, 'last')
 #.binファイルに出力したモデルを読み込んで再テストする
 print_kai('start eval model after quantization')
 with open(args.checkpoint + 'output/epoch_{}.bin'.format('last'), 'rb') as f:
-    reader = NNUEReader(f)
+    reader = NNUEReader(f, L1=network_size[0], L2=network_size[1], L3=network_size[2])
 model = reader.model
 model.to(device)
 

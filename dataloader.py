@@ -11,17 +11,17 @@ import torch
 from cshogi import Board, HuffmanCodedPosAndEval, BLACK, WHITE, BLACK_WIN, WHITE_WIN, move_to_usi
 from features_halfkp import *
 
-def make_result(game_result, color):
+def make_result(game_result, color, label_smoothing=0.0):
     if color == BLACK:
         if game_result == BLACK_WIN:
-            return 1
+            return 1.0 - label_smoothing
         if game_result == WHITE_WIN:
-            return 0
+            return 0.0 + label_smoothing
     else:
         if game_result == BLACK_WIN:
-            return 0
+            return 0.0 + label_smoothing
         if game_result == WHITE_WIN:
-            return 1
+            return 1.0 - label_smoothing
     return 0.5
 
 def dire_list_to_files(dire_list):
@@ -38,7 +38,7 @@ def dire_list_to_files(dire_list):
     return files
 
 class HcpeDataLoader:
-    def __init__(self, files, batch_size, device, shuffle=False, eval_a=600, pin_memory=True, unique=True):
+    def __init__(self, files, batch_size, device, shuffle=False, eval_a=600, label_smoothing=0.0, result_label_noise=0.0, pin_memory=True, unique=True):
         self.unique = unique
         
         #評価値を勝率に変換する際に使う値。データから調整したほうが良い。
@@ -48,11 +48,14 @@ class HcpeDataLoader:
             self.use_eval = True
         else:
             self.use_eval = False
-            
+
         self.load(files)
         self.batch_size = batch_size
         self.device = device
         self.shuffle = shuffle
+
+        self.label_smoothing = label_smoothing
+        self.result_label_noise = result_label_noise
 
         self.X1_torch = torch.empty((self.batch_size, features_num), dtype=torch.float32, pin_memory=pin_memory)
         self.X2_torch = torch.empty((self.batch_size, features_num), dtype=torch.float32, pin_memory=pin_memory)
@@ -83,17 +86,22 @@ class HcpeDataLoader:
 
     def hcpe_to_value_output(self, hcpe):
         if not self.use_eval or hcpe['eval'] == 0:
-            return make_result(hcpe['gameResult'], self.board.turn)
+            return make_result(hcpe['gameResult'], self.board.turn, label_smoothing=self.label_smoothing)
         return hcpe['eval'] / 1000
 
     def mini_batch(self, hcpevec):
         self.X1.fill(0)
         self.X2.fill(0)
+        if self.result_label_noise > 0.0:
+            self.noise = np.random.uniform(-self.result_label_noise, self.result_label_noise, size=(self.batch_size, 1))
         for i, hcpe in enumerate(hcpevec):
             self.board.set_hcp(hcpe['hcp'])
             make_input_features(self.board, self.X1[i], self.X2[i], fill_zero=False)
-            self.result[i] = make_result(hcpe['gameResult'], self.board.turn)
+            self.result[i] = make_result(hcpe['gameResult'], self.board.turn, label_smoothing=self.label_smoothing)
             self.value[i] = self.hcpe_to_value_output(hcpe)
+
+        if self.result_label_noise > 0.0:
+            self.result = self.result + self.noise
 
         if self.device.type == 'cpu':
             return (self.X1_torch.clone(), self.X2_torch.clone(), 

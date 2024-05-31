@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from collections import OrderedDict
 from struct import unpack_from
 import struct
-
+from functools import reduce
+import operator
 from features_halfkp import*
 
 VERSION = 0x7AF32F16
@@ -84,11 +85,17 @@ class NNUEWriter:
 
     def write_header(self, model, fc_hash):
         self.int32(VERSION)
-        #0x5d69d5b8 <= HalfKPのHash
         self.int32(fc_hash ^ self.halfkp_hash ^ (model.units[0] * 2))
-        description = b"Features=HalfKP(Friend)[125388->256x2],"
-        description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32]"
-        description += b"(ClippedReLU[32](AffineTransform[32<-512](InputSlice[512(0:512)])))))"
+        if model.units[0] == 256 and model.units[1] == 32 and model.units[2] == 32:
+            description = b"Features=HalfKP(Friend)[125388->256x2],"
+            description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32]"
+            description += b"(ClippedReLU[32](AffineTransform[32<-512](InputSlice[512(0:512)])))))"
+        elif model.units[0] == 1024 and model.units[1] == 8 and model.units[2] == 32:
+            description = b"Features=HalfKP(Friend)[125388->1024x2],"
+            description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-8]"
+            description += b"(ClippedReLU[8](AffineTransform[8<-2048](InputSlice[2048(0:2048)])))))"
+        else:
+            raise ValueError()
         self.int32(len(description)) # Network definition
         self.buf.extend(description)
 
@@ -185,50 +192,59 @@ class NNUEWriter:
         return
 
 class NNUEReader:
-    def __init__(self, f):
+    def __init__(self, f, L1=1024, L2=8, L3=32):
         self.f = f
-        self.model = NNUE_halfkp()
-        self.read_weights()
+        self.halfkp_hash = 0x5d69d5b8
+        self.model = NNUE_halfkp(L1=L1, L2=L2, L3=L3)
+        fc_hash = NNUEWriter(self.model).fc_hash(self.model)
+        self.read_header(fc_hash)
+        self.read_int32(self.halfkp_hash ^ (self.model.units[0] * 2)) # Feature transformer hash
+        self.read_feature_transformer(self.model.input_layer)
+        self.read_int32(fc_hash) # FC layers hash
+        self.read_fc_layer(self.model.l1)
+        self.read_fc_layer(self.model.l2)
+        self.read_fc_layer(self.model.output_layer, is_output=True)
 
-    def read_weights(self):
-        i = 178
-        nn_data = self.f.read()
-        input_layer_weight = np.array(unpack_from("<"+str(256*125388)+"h", nn_data, 16+i+256*2) )#.reshape(125388,256).T
-        input_layer_bias = np.array(unpack_from("<"+str(256)+"h", nn_data, 16+i))
-        weight_L1 = np.array(unpack_from("<"+str(512*32)+"b", nn_data, 16+i+2*(256+256*125388)+4 + 4*32))#.reshape(32,512)
-        weight_L2 = np.array(unpack_from("<"+str(32*32)+"b", nn_data, 16+i+2*(256+256*125388)+4+ 4*32+32*512 + 4*32))#.reshape(32,32)
-        weight_L3 = np.array(unpack_from("<"+str(32*1)+"b", nn_data, 16+i+2*(256+256*125388)+4+ 4*32+32*512 + 4*32+32*32 + 4*1))
-        bias_L1 = np.array(unpack_from("<"+str(32)+"i", nn_data, 16+i+2*(256+256*125388)+4))
-        bias_L2 = np.array(unpack_from("<"+str(32)+"i", nn_data, 16+i+2*(256+256*125388)+4+ 4*32+32*512))
-        bias_L3 = np.array(unpack_from("<"+str(1)+"i", nn_data, 16+i+2*(256+256*125388)+4+ 4*32+32*512 + 4*32+32*32))
+    def read_header(self, fc_hash):
+        self.read_int32(VERSION) # version
+        self.read_int32(fc_hash ^ self.halfkp_hash ^ (self.model.units[0] * 2)) # halfkp network hash
+        desc_len = self.read_int32() # Network definition
+        description = self.f.read(desc_len)
 
-        
+    def tensor(self, dtype, shape):
+        d = np.fromfile(self.f, dtype, reduce(operator.mul, shape, 1))
+        d = torch.from_numpy(d.astype(np.float32))
+        d = d.reshape(shape)
+        return d
 
-        self.model.input_layer.weight.data = torch.from_numpy(input_layer_weight.astype(np.float32)).reshape(self.model.input_layer.weight.shape[::-1]).divide(127.0).transpose(0, 1)
-        self.model.input_layer.bias.data = torch.from_numpy(input_layer_bias.astype(np.float32)).reshape(self.model.input_layer.bias.shape).divide(127.0)
-        
-        def A1(layer, w, b, a1, a2, a3):
-            a4 = a3 / a2
-            #non_padded_shape = layer.weight.shape
-            #padded_shape = (non_padded_shape[0], ((non_padded_shape[1]+31)//32)*32)
-            weight = torch.from_numpy(w.astype(np.float32)).reshape(layer.weight.shape).divide(a4)
-            bias = torch.from_numpy(b.astype(np.float32)).reshape(layer.bias.shape).divide(a3)
-            #return weight[:non_padded_shape[0], :non_padded_shape[1]], bias
-            return weight, bias
+    def read_feature_transformer(self, layer):
+        layer.bias.data = self.tensor(np.int16, layer.bias.shape).divide(127.0)
+        # weights stored as [41024][256], so we need to transpose the pytorch [256][41024]
+        weights = self.tensor(np.int16, layer.weight.shape[::-1])
+        layer.weight.data = weights.divide(127.0).transpose(0, 1)
 
+    def read_fc_layer(self, layer, is_output=False):
+        # FC layers are stored as int8 weights, and int32 biases
         kWeightScaleBits = 6
         kActivationScale = 127.0
-        kBiasScale_2 = 9600.0
-        kBiasScale_1 = (1 << kWeightScaleBits) * kActivationScale
-        
-        w1, b1 = A1(self.model.l1, weight_L1, bias_L1, kWeightScaleBits, kActivationScale, kBiasScale_1)
-        w2, b2 = A1(self.model.l2, weight_L2, bias_L2, kWeightScaleBits, kActivationScale, kBiasScale_1)
-        w3, b3 = A1(self.model.output_layer, weight_L3, bias_L3, kWeightScaleBits, kActivationScale, kBiasScale_2)
+        if not is_output:
+            kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
+        else:
+            kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
+        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+        # FC inputs are padded to 32 elements for simd.
+        non_padded_shape = layer.weight.shape
+        padded_shape = (non_padded_shape[0], ((non_padded_shape[1]+31)//32)*32)
+        layer.bias.data = self.tensor(np.int32, layer.bias.shape).divide(kBiasScale)
+        layer.weight.data = self.tensor(np.int8, padded_shape).divide(kWeightScale)
+        # Strip padding.
+        layer.weight.data = layer.weight.data[:non_padded_shape[0], :non_padded_shape[1]]
 
-        self.model.l1.weight.data = w1
-        self.model.l1.bias.data = b1
-        self.model.l2.weight.data = w2
-        self.model.l2.bias.data = b2
-        self.model.output_layer.weight.data = w3
-        self.model.output_layer.bias.data = b3
-        return
+    def read_int32(self, expected=None):
+        v = struct.unpack("<I", self.f.read(4))[0]
+        if expected is not None and v != expected:
+            raise Exception("Expected: %x, got %x" % (expected, v))
+        return v
+
+if __name__ == '__main__':
+    pass
