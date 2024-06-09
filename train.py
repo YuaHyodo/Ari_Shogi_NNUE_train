@@ -67,6 +67,10 @@ parser.add_argument('--sgd_momentum', type=float, default=0.9)
 parser.add_argument('--sgd_nesterov', action='store_true')
 parser.add_argument('--adam_eps', type=float, default=1e-8)
 
+#蒸留用モデル
+parser.add_argument('--distillation_model', type=str)
+parser.add_argument('--distillation_model_network', type=str, default='HalfKP_256_32_32')
+
 #学習率スケジューラーに関して
 #CyclicLRの場合、設定された学習率をbase、その--CyclicLR_maxLR倍の値をmaxに設定する
 #ReduceLROnPlateauの場合、設定された学習率を初期値に設定する
@@ -252,6 +256,16 @@ else:
     else:
         print_kai('LR_scheduler = None')
 
+if args.distillation_model:
+    print_kai('load distillation_model from {}'.format(args.distillation_model))
+    s = [int(i) for i in args.distillation_model_network.split('_')[1:]]
+    with open(args.distillation_model, 'rb') as f:
+        reader = NNUEReader(f, L1=s[0], L2=s[1], L3=s[2])
+    distillation_model = reader.model
+    distillation_model.to(device)
+    distillation_model.eval()
+    
+
 train_data_files = dire_list_to_files(args.train_data)
 N = 10
 if len(train_data_files) < N:
@@ -306,7 +320,7 @@ def eval_model(model, dataloader, batch_num=None):
         with torch.no_grad():
             x1, x2, result, value = dataloader.sample()
             y = model(x1, x2)
-            if dataloader.eval_a == 0:
+            if dataloader.eval_a == 0 or args.val_lambda <= 0:
                 test_loss = bce_with_logits_loss(y, result).item()
             else:
                 loss1 = bce_with_logits_loss(y, result)#勝敗項
@@ -322,7 +336,7 @@ def eval_model(model, dataloader, batch_num=None):
         test_steps += 1
         with torch.no_grad():
             y = model(x1, x2)
-            if dataloader.eval_a == 0:
+            if dataloader.eval_a == 0 or args.val_lambda <= 0:
                 #評価値を使わない場合
                 test_loss += bce_with_logits_loss(y, result).item()
             else:
@@ -356,7 +370,13 @@ for e in range(args.epoch):
             with torch.cuda.amp.autocast(enabled=args.use_amp):
                 model.train()
                 y = model(x1, x2)
-                if train_dataloader.eval_a == 0:
+                if args.distillation_model:
+                    with torch.no_grad():
+                        d_model_value = distillation_model(x1, x2)
+                    loss1 = bce_with_logits_loss(y, result)
+                    loss2 = bce_with_logits_loss(y, d_model_value.sigmoid())
+                    loss = (loss1 * (1.0 - args.val_lambda) + loss2 * args.val_lambda)
+                elif train_dataloader.eval_a == 0 or args.val_lambda <= 0:
                     #評価値を使わない場合
                     loss = bce_with_logits_loss(y, result)
                 else:
